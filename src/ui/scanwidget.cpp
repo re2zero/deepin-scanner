@@ -21,6 +21,7 @@
 #include <QPainter>
 #include <QMap>
 #include <QFutureWatcher>
+#include <QElapsedTimer>
 #include <QtConcurrent>
 #include <qmath.h>
 #include <limits>
@@ -583,6 +584,9 @@ ScanWidget::ScanSaveResult ScanWidget::saveScan(const ScanSaveRequest &request)
     result.filePath = request.filePath;
     result.paperSize = request.paperSize;
 
+    QElapsedTimer saveTimer;
+    saveTimer.start();
+
     QImage processedImage = request.image;
     if (request.colorMode == 1) {   // GRAYSCALE
         processedImage = processedImage.convertToFormat(QImage::Format_Grayscale8);
@@ -606,6 +610,9 @@ ScanWidget::ScanSaveResult ScanWidget::saveScan(const ScanSaveRequest &request)
         qDebug() << "Using selected paper size:" << request.paperSize;
         processedImage = scaleToPaperSize(processedImage, request.paperSize, request.dpi);
     }
+
+    const qint64 processMs = saveTimer.elapsed();
+    saveTimer.restart();
 
     if (request.formatIndex < 4) {   // PNG/JPG/BMP/TIFF
         result.success = processedImage.save(result.filePath, FORMATS[request.formatIndex].toLatin1().constData());
@@ -631,6 +638,7 @@ ScanWidget::ScanSaveResult ScanWidget::saveScan(const ScanSaveRequest &request)
         }
     }
 
+    qCInfo(app) << "Scan save timing: process" << processMs << "ms, write" << saveTimer.elapsed() << "ms, format" << FORMATS[request.formatIndex];
     return result;
 }
 

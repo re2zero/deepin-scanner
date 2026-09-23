@@ -15,6 +15,7 @@
 #include <QDateTime>
 #include <QStandardPaths>
 #include <QMetaType>
+#include <QElapsedTimer>
 
 using namespace DDLog;
 
@@ -404,8 +405,12 @@ void ScannerWorker::doOpenDevice(const QString &deviceName)
 
     m_deviceName = deviceName;
 
+    QElapsedTimer openTimer;
+    openTimer.start();
+
     QByteArray deviceNameBytes = deviceName.toUtf8();
     SANE_Status status = sane_open(deviceNameBytes.constData(), &m_device);
+    const qint64 openMs = openTimer.elapsed();
     
     if (status != SANE_STATUS_GOOD) {
         emit errorOccurred(tr("Failed to open SANE device '%1': %2").arg(deviceName).arg(sane_strstatus(status)));
@@ -420,7 +425,9 @@ void ScannerWorker::doOpenDevice(const QString &deviceName)
     }
 
     m_deviceOpen = true;
+    openTimer.restart();
     updateSupportedOptions();
+    qCInfo(app) << "Worker: Device" << deviceName << "opened in" << openMs << "ms, options read in" << openTimer.elapsed() << "ms";
     qCDebug(app) << "Worker: Device" << deviceName << "opened successfully.";
 #else
     m_usingTestDevice = true;
@@ -460,16 +467,20 @@ bool ScannerWorker::reopenDevice()
     m_device = nullptr;
     m_deviceOpen = false;
 
+    QElapsedTimer openTimer;
+    openTimer.start();
+
     QByteArray deviceNameBytes = m_deviceName.toUtf8();
     SANE_Status status = sane_open(deviceNameBytes.constData(), &m_device);
     if (status != SANE_STATUS_GOOD) {
-        qCWarning(app) << "Worker: Failed to re-open device" << m_deviceName << ":" << sane_strstatus(status);
+        qCWarning(app) << "Worker: Failed to re-open device" << m_deviceName << "after" << openTimer.elapsed() << "ms:" << sane_strstatus(status);
         m_device = nullptr;
         m_deviceOpen = false;
         return false;
     }
 
     m_deviceOpen = true;
+    qCInfo(app) << "Worker: Device" << m_deviceName << "re-opened in" << openTimer.elapsed() << "ms";
     return true;
 }
 
@@ -535,6 +546,9 @@ void ScannerWorker::doStartScan(const QString &tempOutputFilePath, int dpi, Scan
         return;
     }
 
+    QElapsedTimer scanTimer;
+    scanTimer.start();
+
     doSetScanMode(mode);
     doSetColorMode(colorMode);
     doSetResolution(dpi);
@@ -546,8 +560,13 @@ void ScannerWorker::doStartScan(const QString &tempOutputFilePath, int dpi, Scan
     
     m_scanCancelled = false;
 
+    const qint64 optionsMs = scanTimer.elapsed();
+    scanTimer.restart();
+
     // Start the scan
     SANE_Status status = sane_start(m_device);
+    const qint64 startMs = scanTimer.elapsed();
+    scanTimer.restart();
     if (status != SANE_STATUS_GOOD) {
         reportScanFailure(tr("Failed to start scan: %1").arg(sane_strstatus(status)));
         return;
@@ -562,7 +581,10 @@ void ScannerWorker::doStartScan(const QString &tempOutputFilePath, int dpi, Scan
     }
 
     status = scan_it(ofp); // The blocking call
+    const qint64 readMs = scanTimer.elapsed();
     fclose(ofp);
+
+    qCInfo(app) << "Worker: scan timing: options" << optionsMs << "ms, sane_start" << startMs << "ms, read" << readMs << "ms";
 
     if (m_scanCancelled) {
         QFile::remove(tempOutputFilePath);
@@ -797,6 +819,10 @@ SANE_Status ScannerWorker::scan_it(FILE *ofp)
     png_write_info(png_ptr, info_ptr);
     // End dummy png header
 
+    QElapsedTimer readTimer;
+    readTimer.start();
+    int linesRead = 0;
+
     do {
         if (m_scanCancelled) {
             status = SANE_STATUS_CANCELLED;
@@ -807,8 +833,11 @@ SANE_Status ScannerWorker::scan_it(FILE *ofp)
         
         if (status == SANE_STATUS_GOOD) {
             png_write_row(png_ptr, buffer);
+            linesRead++;
         }
     } while (status == SANE_STATUS_GOOD);
+
+    qCInfo(app) << "Worker: read" << linesRead << "of" << parm.lines << "lines in" << readTimer.elapsed() << "ms";
 
     png_write_end(png_ptr, info_ptr);
     png_destroy_write_struct(&png_ptr, &info_ptr);
