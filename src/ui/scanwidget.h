@@ -98,6 +98,9 @@ private:
 
     DeviceBase* m_device = nullptr;
     bool m_isScanner;
+    // True while the camera is being reconfigured off the UI thread, so a scan cannot be
+    // started against a device that is currently closing and re-opening.
+    bool m_cameraBusy = false;
 
     QMutex m_previewMutex;
 

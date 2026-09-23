@@ -240,7 +240,6 @@ bool WebcamDevice::setResolution(int width, int height)
     // Save original state
     bool wasInitialized = m_isInitialized;
     bool wasDeviceSelected = m_deviceSelected;
-    bool wasPreviewActive = m_previewTimer.isActive();
 
     // Save current device path
     QString devicePath;
@@ -260,11 +259,6 @@ bool WebcamDevice::setResolution(int width, int height)
         // Here we can add fallback method to get device path
     }
 
-    // Stop preview and completely close device
-    if (wasPreviewActive) {
-        stopPreview();
-    }
-
     // Completely close device and release all resources
     closeDevice();
 
@@ -276,7 +270,9 @@ bool WebcamDevice::setResolution(int width, int height)
 
     // Reopen device
     qCDebug(app) << "Reopening device:" << devicePath;
-    m_fd = open(devicePath.toUtf8().constData(), O_RDWR);
+    // O_NONBLOCK matters here: the preview reads frames with VIDIOC_DQBUF from the UI
+    // thread, and a blocking file descriptor would stall it until the next frame arrives.
+    m_fd = open(devicePath.toUtf8().constData(), O_RDWR | O_NONBLOCK);
     if (m_fd <= 0) {
         qCDebug(app) << "Failed to reopen device:" << strerror(errno);
         emit errorOccurred(tr("Failed to reopen device"));
@@ -337,10 +333,10 @@ bool WebcamDevice::setResolution(int width, int height)
     // Re-enumerate resolutions and notify UI
     enumerateSupportedResolutions();
 
-    // If preview was active before, restore it
-    if (wasPreviewActive) {
-        startPreview();
-    }
+    // Open the stream again, here and not in the caller: this runs on a worker thread,
+    // while the preview timer belongs to the UI thread (see startStream()). The caller is
+    // expected to have stopped the preview before calling, and restarts it afterwards.
+    startStream();
 
     qCDebug(app) << "Successfully completed resolution setting:" << m_width << "x" << m_height;
     return true;

@@ -327,6 +327,11 @@ void ScanWidget::startScanning()
         return;
     }
 
+    if (m_cameraBusy) {
+        // The camera is still being reconfigured, a capture now would race with it.
+        return;
+    }
+
     resetPreview();
     m_device->startCapture();
 }
@@ -463,7 +468,26 @@ void ScanWidget::onResolutionChanged(int index)
             QString res = m_resolutionCombo->itemText(index);
             QStringList parts = res.split('x');
             if (parts.size() == 2) {
-                webcam->setResolution(parts[0].toInt(), parts[1].toInt());
+                // Reconfiguring the camera (close, re-open, set the format, map the buffers
+                // and start the stream) takes about a second, so it runs off the UI thread.
+                // The preview is stopped here, on this thread, and restarted when the new
+                // resolution is up.
+                m_cameraBusy = true;
+                m_previewLabel->setText(tr("Initializing preview..."));
+                webcam->stopPreview();
+
+                const int width = parts[0].toInt();
+                const int height = parts[1].toInt();
+                auto *watcher = new QFutureWatcher<bool>(webcam);
+                connect(watcher, &QFutureWatcher<bool>::finished, webcam, [this, webcam, watcher]() {
+                    const bool changed = watcher->result();
+                    watcher->deleteLater();
+                    m_cameraBusy = false;
+                    if (changed) {
+                        webcam->startPreview();
+                    }
+                });
+                watcher->setFuture(QtConcurrent::run(&WebcamDevice::setResolution, webcam, width, height));
             }
         }
     }
