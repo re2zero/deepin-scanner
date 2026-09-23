@@ -54,7 +54,6 @@ ScannerDevice::ScannerDevice(QObject *parent)
     connect(m_worker, &ScannerWorker::deviceUnavailable, this, &ScannerDevice::deviceUnavailable);
     connect(m_worker, &ScannerWorker::availableDevicesReady, this, &ScannerDevice::onAvailableDevicesReady);
     connect(m_worker, &ScannerWorker::captureCompleted, this, &ScannerDevice::onCaptureCompleted);
-    connect(m_worker, &ScannerWorker::scanProgress, this, &ScannerDevice::scanProgress); // Forward signal
 
     m_workerThread.start();
     qCInfo(app) << "Scanner worker thread started.";
@@ -345,11 +344,6 @@ struct ScannerWorker::Image
 
 ScannerWorker::ScannerWorker() : QObject(nullptr)
 {
-    // Set SANE_DEBUG env vars for more info
-    qputenv("SANE_DEBUG_DLL", "2");
-    qputenv("SANE_DEBUG_NET", "2");
-    qputenv("SANE_DEBUG_HPAIO", "2");
-    qputenv("SANE_DEBUG_USB", "2");
 }
 
 ScannerWorker::~ScannerWorker()
@@ -803,9 +797,6 @@ SANE_Status ScannerWorker::scan_it(FILE *ofp)
     png_write_info(png_ptr, info_ptr);
     // End dummy png header
 
-    int total_lines = parm.lines > 0 ? parm.lines : 1000; // Guess if not provided
-    int lines_read = 0;
-
     do {
         if (m_scanCancelled) {
             status = SANE_STATUS_CANCELLED;
@@ -816,10 +807,6 @@ SANE_Status ScannerWorker::scan_it(FILE *ofp)
         
         if (status == SANE_STATUS_GOOD) {
             png_write_row(png_ptr, buffer);
-            lines_read++;
-            if (parm.lines > 0) {
-                emit scanProgress((lines_read * 100) / total_lines);
-            }
         }
     } while (status == SANE_STATUS_GOOD);
 

@@ -16,6 +16,7 @@
 #include <QMutexLocker>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
@@ -34,6 +35,11 @@
 #endif
 
 using namespace DDLog;
+
+// Waiting for a frame needs a timeout: a camera can take well over a second for the first
+// frame at its highest resolution, but a stream that stopped (unplugged device) must not
+// block the caller forever.
+static const int FRAME_WAIT_TIMEOUT_MS = 2000;
 
 // WebcamDevice implementation
 WebcamDevice::WebcamDevice(QObject *parent)
@@ -257,9 +263,6 @@ bool WebcamDevice::setResolution(int width, int height)
     // Completely close device and release all resources
     closeDevice();
 
-    // Give system some time to fully release device
-    QThread::msleep(500);
-
     // Without device path, cannot continue
     if (devicePath.isEmpty()) {
         emit errorOccurred(tr("Cannot get device path, cannot set resolution"));
@@ -366,9 +369,6 @@ bool WebcamDevice::startCapturing()
     v4l2_buf_type stopType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(m_fd, VIDIOC_STREAMOFF, &stopType);
 
-    // Wait for device to stabilize
-    QThread::msleep(100);
-
     // Debug buffer status
     qCDebug(app) << "Buffer status:";
     for (int i = 0; i < 4; i++) {
@@ -419,17 +419,18 @@ bool WebcamDevice::startCapturing()
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index = i;
 
-        int result = ioctl(m_fd, VIDIOC_QBUF, &buf);
-        if (result == -1) {
-            // Handle special cases in non-blocking mode
-            if (errno == EAGAIN) {
-                // In non-blocking mode, we may need multiple attempts
-                qCDebug(app) << "Buffer not ready yet (EAGAIN), retrying...";
-                QThread::msleep(10);
-                i--; // Retry current buffer
-                continue;
+        int result = -1;
+        // In non-blocking mode a buffer may not be ready yet: retry a bounded number of
+        // times instead of retrying the same buffer forever.
+        for (int attempt = 0; attempt < 50; attempt++) {
+            result = ioctl(m_fd, VIDIOC_QBUF, &buf);
+            if (result != -1 || errno != EAGAIN) {
+                break;
             }
-            
+            qCDebug(app) << "Buffer not ready yet (EAGAIN), retrying...";
+            QThread::msleep(10);
+        }
+        if (result == -1) {
             qCWarning(app) << "Failed to enqueue buffer" << i << ":" << strerror(errno) << "(errno:" << errno << ")";
 
             // Clean up any already enqueued buffers
@@ -594,16 +595,12 @@ void WebcamDevice::captureImage()
 
         // Ensure current state is cleaned up
         stopCapturing();
-        QThread::msleep(100);
 
         // Start capture process
         if (!startCapturing()) {
             emit errorOccurred(tr("Failed to start video stream, capture failed"));
             return;
         }
-
-        // Wait for device to be ready
-        QThread::msleep(300);
     } else {
         // If preview is running, pause timer but keep stream active
         m_previewTimer.stop();
@@ -617,13 +614,13 @@ void WebcamDevice::captureImage()
 
         qCDebug(app) << "Attempting to get frame directly from device (attempt" << (retry + 1) << ")";
 
-        // Temporarily switch to blocking mode to ensure frame capture
-        int flags = fcntl(m_fd, F_GETFL, 0);
-        fcntl(m_fd, F_SETFL, flags & ~O_NONBLOCK);
+        // Wait for a frame with a timeout instead of blocking in VIDIOC_DQBUF: the file
+        // descriptor stays in non-blocking mode, so a stalled stream cannot hang here.
+        struct pollfd pfd = { m_fd, POLLIN, 0 };
+        const int ready = poll(&pfd, 1, FRAME_WAIT_TIMEOUT_MS);
+        const bool gotFrame = (ready > 0) && (ioctl(m_fd, VIDIOC_DQBUF, &buf) != -1);
 
-        if (ioctl(m_fd, VIDIOC_DQBUF, &buf) == -1) {
-            // Restore non-blocking mode
-            fcntl(m_fd, F_SETFL, flags);
+        if (!gotFrame) {
             
             qCWarning(app) << "Failed to get frame:" << strerror(errno);
             if (retry == 2) {   // Last attempt failed
@@ -643,13 +640,8 @@ void WebcamDevice::captureImage()
                 }
                 return;
             }
-            // Brief wait before retry
-            QThread::msleep(100);
             continue;
         }
-
-        // Restore non-blocking mode
-        fcntl(m_fd, F_SETFL, flags);
 
         // Ensure buffer index is valid
         if (buf.index >= 4 || !m_buffers[buf.index]) {
@@ -684,9 +676,6 @@ void WebcamDevice::captureImage()
         } else {
             qCWarning(app) << "Image conversion failed - retrying";
         }
-
-        // Brief wait before retry
-        QThread::msleep(100);
     }
 
     // If all attempts failed
@@ -714,66 +703,41 @@ QImage WebcamDevice::frameToQImage(const void *data, int width, int height, int 
         const uint8_t *yuyv = static_cast<const uint8_t *>(data);
 
         // Safety check - ensure enough memory
-        size_t expectedSize = width * height * 2;   // YUYV格式每个像素需要2字节
-        if (expectedSize > 0) {   // 合理的大小上限
-            try {
-                for (int y = 0; y < height; y++) {
-                    for (int x = 0; x < width; x += 2) {
-                        int i = y * width * 2 + x * 2;
-
-                        // Boundary check
-                        if (i + 3 >= expectedSize) {
-                            qCWarning(app) << "Frame data boundary check failed - possible incomplete data";
-                            continue;
-                        }
-
-                        int y0 = yuyv[i];
-                        int u = yuyv[i + 1];
-                        int y1 = yuyv[i + 2];
-                        int v = yuyv[i + 3];
-
-                        // Keep original brightness value
-                        y0 = y0;
-                        y1 = y1;
-
-                        int r, g, b;
-
-                        // First pixel - use more accurate YUV to RGB conversion
-                        r = static_cast<int>(y0 + 1.370705 * (v - 128));
-                        g = static_cast<int>(y0 - 0.337633 * (u - 128) - 0.698001 * (v - 128));
-                        b = static_cast<int>(y0 + 1.732446 * (u - 128));
-
-                        r = qBound(0, r, 255);
-                        g = qBound(0, g, 255);
-                        b = qBound(0, b, 255);
-
-                        if (x < width) {   // Safety check
-                            image.setPixel(x, y, qRgb(r, g, b));
-                        }
-
-                        // Second pixel - use same conversion formula
-                        r = static_cast<int>(y1 + 1.370705 * (v - 128));
-                        g = static_cast<int>(y1 - 0.337633 * (u - 128) - 0.698001 * (v - 128));
-                        b = static_cast<int>(y1 + 1.732446 * (u - 128));
-
-                        r = qBound(0, r, 255);
-                        g = qBound(0, g, 255);
-                        b = qBound(0, b, 255);
-
-                        if (x + 1 < width) {   // Safety check
-                            image.setPixel(x + 1, y, qRgb(r, g, b));
-                        }
-                    }
-                }
-                return image;
-            } catch (const std::exception &e) {
-            qCCritical(app) << "Frame conversion exception:" << e.what();
-            } catch (...) {
-            qCCritical(app) << "Unknown exception during frame conversion";
-            }
-        } else {
+        const size_t expectedSize = static_cast<size_t>(width) * height * 2;   // YUYV: 2 bytes per pixel
+        if (expectedSize == 0) {
             qCWarning(app) << "Invalid frame size:" << expectedSize;
+            return QImage();
         }
+
+        for (int y = 0; y < height; y++) {
+            // Write through the scanline pointer: calling setPixel() for every pixel is far
+            // too slow for a full camera frame.
+            uchar *line = image.scanLine(y);
+            const uint8_t *row = yuyv + static_cast<size_t>(y) * width * 2;
+
+            for (int x = 0; x + 1 < width; x += 2) {
+                const int i = x * 2;
+                const int y0 = row[i];
+                const int u = row[i + 1];
+                const int y1 = row[i + 2];
+                const int v = row[i + 3];
+
+                int r = static_cast<int>(y0 + 1.370705 * (v - 128));
+                int g = static_cast<int>(y0 - 0.337633 * (u - 128) - 0.698001 * (v - 128));
+                int b = static_cast<int>(y0 + 1.732446 * (u - 128));
+                line[3 * x] = static_cast<uchar>(qBound(0, r, 255));
+                line[3 * x + 1] = static_cast<uchar>(qBound(0, g, 255));
+                line[3 * x + 2] = static_cast<uchar>(qBound(0, b, 255));
+
+                r = static_cast<int>(y1 + 1.370705 * (v - 128));
+                g = static_cast<int>(y1 - 0.337633 * (u - 128) - 0.698001 * (v - 128));
+                b = static_cast<int>(y1 + 1.732446 * (u - 128));
+                line[3 * x + 3] = static_cast<uchar>(qBound(0, r, 255));
+                line[3 * x + 4] = static_cast<uchar>(qBound(0, g, 255));
+                line[3 * x + 5] = static_cast<uchar>(qBound(0, b, 255));
+            }
+        }
+        return image;
     } else if (format == V4L2_PIX_FMT_MJPEG) {
         // Get actual data size instead of calculated value
         v4l2_buffer buf;
@@ -878,41 +842,45 @@ QSize WebcamDevice::getMaxResolution()
         }
     }
 
-    // If discrete resolutions found, get largest one (but no more than 1280x720 unless explicitly supported)
+    // If discrete resolutions are available, the default is a resolution that keeps the
+    // stream responsive: the highest resolution a device offers can be far too slow (a
+    // 3264x2448 frame takes about 1.7 s and the stream drops to a few frames per second),
+    // and every size stays selectable in the UI.
     if (resolutionsFound && !supportedSizes.isEmpty()) {
-        // Sort by resolution (total pixels)
+        // Sort by resolution (total pixels), largest first
         std::sort(supportedSizes.begin(), supportedSizes.end(),
                   [](const QSize &a, const QSize &b) {
                       return a.width() * a.height() > b.width() * b.height();
                   });
 
-        // Select largest resolution not exceeding 720p (unless explicitly supports higher)
-        for (const QSize &size : supportedSizes) {
-            // If we find a reasonable resolution, use it
-            maxWidth = size.width();
-            maxHeight = size.height();
-
-            // If at least 720p resolution found, use it directly
-            if (maxWidth >= 1280 && maxHeight >= 720) {
-                // Prefer standard resolutions like 720p or 1080p
-                if (maxWidth == 1280 && maxHeight == 720) {
-                    qCInfo(app) << "Selected standard resolution: 1280x720";
-                    return QSize(maxWidth, maxHeight);
+        const auto selectExact = [&supportedSizes](int width, int height) -> QSize {
+            for (const QSize &size : supportedSizes) {
+                if (size.width() == width && size.height() == height) {
+                    return size;
                 }
-
-                if (maxWidth == 1920 && maxHeight == 1080) {
-                    qCInfo(app) << "Selected standard resolution: 1920x1080";
-                    return QSize(maxWidth, maxHeight);
-                }
-
-                // If no exact match, use the first (largest) resolution
-                qCInfo(app) << "Selected maximum resolution:" << supportedSizes.first().width() << "x" << supportedSizes.first().height();
-                return supportedSizes.first();
             }
+            return QSize();
+        };
 
-            // If no sufficiently large resolution found, use largest in list
-            break;
+        QSize selected = selectExact(1920, 1080);
+        if (selected.isEmpty()) {
+            selected = selectExact(1280, 720);
         }
+        if (selected.isEmpty()) {
+            // No standard HD size: use the largest size that is not above 1920x1080.
+            for (const QSize &size : supportedSizes) {
+                if (size.width() <= 1920 && size.height() <= 1080) {
+                    selected = size;
+                    break;
+                }
+            }
+        }
+        if (selected.isEmpty()) {
+            selected = supportedSizes.last();
+        }
+
+        qCInfo(app) << "Selected resolution:" << selected.width() << "x" << selected.height();
+        return selected;
     }
 
     // If previous methods failed, try to get current format
@@ -1363,7 +1331,12 @@ bool WebcamDevice::adjustCommonCameraSettings()
 
     // Debug info: List camera supported controls
     qCDebug(app) << "=== Starting camera optimization ===";
-    listCameraControls();
+
+    // Walking the control ids costs a few hundred milliseconds on some cameras, so the
+    // listing is only done when debug logging is enabled.
+    if (DDLog::app().isDebugEnabled()) {
+        listCameraControls();
+    }
 
     // Parameter configuration strategy (with smart adaptation)
     struct CameraControlConfig {
@@ -1478,7 +1451,6 @@ bool WebcamDevice::adjustCommonCameraSettings()
                     ioctl(m_fd, VIDIOC_S_CTRL, &fallback);
                 }
             }
-            QThread::msleep(50 * (retry + 1));
         }
     }
 
@@ -1593,9 +1565,6 @@ bool WebcamDevice::initMmap()
     if (release_result == -1) {
         qCDebug(app) << "Failed to release existing buffers:" << strerror(errno);
     }
-
-    // Give device some recovery time
-    QThread::msleep(200);
 
     // Initialize buffer array
     for (int i = 0; i < 4; i++) {

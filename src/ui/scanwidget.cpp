@@ -411,11 +411,12 @@ void ScanWidget::onUpdatePreview(const QImage &image)
     }
 
     QMutexLocker locker(&m_previewMutex);
-    QPixmap pixmap = QPixmap::fromImage(image);
-    QPixmap scaled = pixmap.scaled(m_previewLabel->size(),
-                                   Qt::KeepAspectRatio,
-                                   Qt::SmoothTransformation);
-    m_previewLabel->setPixmap(scaled);
+    // Scale the image before converting it to a pixmap: converting a full camera frame
+    // (up to 8 MP) to a pixmap and scaling that is several times more expensive.
+    const QImage scaledImage = image.scaled(m_previewLabel->size(),
+                                           Qt::KeepAspectRatio,
+                                           Qt::FastTransformation);
+    m_previewLabel->setPixmap(QPixmap::fromImage(scaledImage));
     m_previewLabel->setAlignment(Qt::AlignCenter);
 }
 

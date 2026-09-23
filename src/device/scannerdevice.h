@@ -91,7 +91,6 @@ signals:
     void triggerGetAvailableDevices();
 
     // Forwarded signals from worker
-    void scanProgress(int percentage);
     void deviceOpened();
     void deviceClosed();
     void deviceUnavailable(const QString &deviceName);
@@ -148,7 +147,6 @@ signals:
     void deviceUnavailable(const QString &deviceName);
     void availableDevicesReady(const QStringList &deviceNames);
     void captureCompleted(const QString &filePath);
-    void scanProgress(int percentage);
 
 private:
 #ifndef _WIN32
