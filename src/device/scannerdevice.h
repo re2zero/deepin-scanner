@@ -102,6 +102,7 @@ private slots:
     void onDeviceOpened(const QList<int> &resolutions, const QList<ScannerDevice::ScanMode> &modes);
     void onDeviceClosed();
     void onCaptureCompleted(const QString &filePath);
+    void onCaptureCompletedImage(const QImage &image);
     void onAvailableDevicesReady(const QStringList &deviceNames);
 
 private:
@@ -147,11 +148,14 @@ signals:
     void deviceUnavailable(const QString &deviceName);
     void availableDevicesReady(const QStringList &deviceNames);
     void captureCompleted(const QString &filePath);
+    // Sent instead of captureCompleted() when the page could be handed over as an image,
+    // which avoids the PNG temp file (see scan_it()).
+    void captureCompletedImage(const QImage &image);
 
 private:
 #ifndef _WIN32
     struct Image;
-    SANE_Status scan_it(FILE *ofp);
+    SANE_Status scan_it(FILE *ofp, QImage &image);
     void updateSupportedOptions();
     bool reopenDevice();
     void reportScanFailure(const QString &errorMessage);

@@ -55,6 +55,7 @@ ScannerDevice::ScannerDevice(QObject *parent)
     connect(m_worker, &ScannerWorker::deviceUnavailable, this, &ScannerDevice::deviceUnavailable);
     connect(m_worker, &ScannerWorker::availableDevicesReady, this, &ScannerDevice::onAvailableDevicesReady);
     connect(m_worker, &ScannerWorker::captureCompleted, this, &ScannerDevice::onCaptureCompleted);
+    connect(m_worker, &ScannerWorker::captureCompletedImage, this, &ScannerDevice::onCaptureCompletedImage);
 
     m_workerThread.start();
     qCInfo(app) << "Scanner worker thread started.";
@@ -328,6 +329,14 @@ void ScannerDevice::onCaptureCompleted(const QString &filePath)
 }
 
 
+void ScannerDevice::onCaptureCompletedImage(const QImage &image)
+{
+    m_isCapturing = false;
+    setState(Connected);
+
+    emit imageCaptured(image);
+}
+
 // =================================================================
 //  ScannerWorker Implementation (Worker Thread)
 // =================================================================
@@ -580,7 +589,8 @@ void ScannerWorker::doStartScan(const QString &tempOutputFilePath, int dpi, Scan
         return;
     }
 
-    status = scan_it(ofp); // The blocking call
+    QImage scannedImage;
+    status = scan_it(ofp, scannedImage); // The blocking call
     const qint64 readMs = scanTimer.elapsed();
     fclose(ofp);
 
@@ -598,6 +608,10 @@ void ScannerWorker::doStartScan(const QString &tempOutputFilePath, int dpi, Scan
     if (status != SANE_STATUS_GOOD && status != SANE_STATUS_EOF) {
         QFile::remove(tempOutputFilePath);
         reportScanFailure(tr("Scan failed during read: %1").arg(sane_strstatus(status)));
+    } else if (!scannedImage.isNull()) {
+        // The page is already an image, the temp file stayed empty.
+        QFile::remove(tempOutputFilePath);
+        emit captureCompletedImage(scannedImage);
     } else {
         emit captureCompleted(tempOutputFilePath);
     }
@@ -792,7 +806,29 @@ void ScannerWorker::doSetPageSize(double widthMM, double heightMM)
 
 
 #ifndef _WIN32
-SANE_Status ScannerWorker::scan_it(FILE *ofp)
+// The QImage format that matches the SANE frame, or Format_Invalid when the page has to go
+// through the PNG temp file: lineart is bit packed and JPEG/G42D are not raw pixels.
+static QImage::Format imageFormatFor(const SANE_Parameters &parm)
+{
+    if (parm.format == SANE_FRAME_GRAY) {
+        if (parm.depth == 8) {
+            return QImage::Format_Grayscale8;
+        }
+        if (parm.depth == 16) {
+            return QImage::Format_Grayscale16;
+        }
+        return QImage::Format_Invalid;
+    }
+    if (parm.format == SANE_FRAME_RGB && parm.depth == 8) {
+        return QImage::Format_RGB888;
+    }
+    return QImage::Format_Invalid;
+}
+
+// Reads the page. When the frame format can be handed over as an image, `image` is filled
+// and nothing is written to `ofp`; otherwise the page is written there as PNG, which is
+// also what happens when the backend does not tell the line count in advance.
+SANE_Status ScannerWorker::scan_it(FILE *ofp, QImage &image)
 {
     SANE_Parameters parm;
     SANE_Status status;
@@ -807,17 +843,31 @@ SANE_Status ScannerWorker::scan_it(FILE *ofp)
 
     unsigned char *buffer = new unsigned char[parm.bytes_per_line];
 
-    // Dummy PNG write header function.
-    // Replace with your actual implementation if you have one.
-    int bit_depth = (parm.depth == 1) ? 8 : parm.depth;
-    png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    info_ptr = png_create_info_struct(png_ptr);
-    png_init_io(png_ptr, ofp);
-    png_set_IHDR(png_ptr, info_ptr, parm.pixels_per_line, parm.lines, bit_depth,
-                 parm.format == SANE_FRAME_RGB ? PNG_COLOR_TYPE_RGB : PNG_COLOR_TYPE_GRAY,
-                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
-    png_write_info(png_ptr, info_ptr);
-    // End dummy png header
+    QImage::Format imageFormat = QImage::Format_Invalid;
+    if (parm.lines > 0) {
+        imageFormat = imageFormatFor(parm);
+        if (imageFormat != QImage::Format_Invalid) {
+            image = QImage(parm.pixels_per_line, parm.lines, imageFormat);
+            if (image.isNull()) {
+                imageFormat = QImage::Format_Invalid;
+            }
+        }
+    }
+
+    const bool writePng = imageFormat == QImage::Format_Invalid;
+    if (writePng) {
+        // Dummy PNG write header function.
+        // Replace with your actual implementation if you have one.
+        int bit_depth = (parm.depth == 1) ? 8 : parm.depth;
+        png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+        info_ptr = png_create_info_struct(png_ptr);
+        png_init_io(png_ptr, ofp);
+        png_set_IHDR(png_ptr, info_ptr, parm.pixels_per_line, parm.lines, bit_depth,
+                     parm.format == SANE_FRAME_RGB ? PNG_COLOR_TYPE_RGB : PNG_COLOR_TYPE_GRAY,
+                     PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+        png_write_info(png_ptr, info_ptr);
+        // End dummy png header
+    }
 
     QElapsedTimer readTimer;
     readTimer.start();
@@ -829,18 +879,34 @@ SANE_Status ScannerWorker::scan_it(FILE *ofp)
             break;
         }
 
+        if (!writePng && linesRead >= parm.lines) {
+            break;   // the image is complete
+        }
+
         status = sane_read(m_device, buffer, parm.bytes_per_line, &len);
         
         if (status == SANE_STATUS_GOOD) {
-            png_write_row(png_ptr, buffer);
+            if (writePng) {
+                png_write_row(png_ptr, buffer);
+            } else {
+                memcpy(image.scanLine(linesRead), buffer, qMin(len, image.bytesPerLine()));
+            }
             linesRead++;
         }
     } while (status == SANE_STATUS_GOOD);
 
-    qCInfo(app) << "Worker: read" << linesRead << "of" << parm.lines << "lines in" << readTimer.elapsed() << "ms";
+    if (!writePng && linesRead > 0 && linesRead < parm.lines) {
+        // The backend stopped early, keep only the lines that arrived.
+        image = image.copy(0, 0, image.width(), linesRead);
+    }
 
-    png_write_end(png_ptr, info_ptr);
-    png_destroy_write_struct(&png_ptr, &info_ptr);
+    qCInfo(app) << "Worker: read" << linesRead << "of" << parm.lines << "lines in" << readTimer.elapsed() << "ms"
+                << (writePng ? "(via PNG temp file)" : "(direct image)");
+
+    if (writePng) {
+        png_write_end(png_ptr, info_ptr);
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+    }
     delete[] buffer;
 
     if (status != SANE_STATUS_EOF) {
