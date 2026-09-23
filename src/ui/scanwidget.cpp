@@ -20,6 +20,8 @@
 #include <QTransform>
 #include <QPainter>
 #include <QMap>
+#include <QFutureWatcher>
+#include <QtConcurrent>
 #include <qmath.h>
 #include <limits>
 
@@ -536,128 +538,154 @@ void ScanWidget::setSaveDirectory(const QString &dir)
 
 void ScanWidget::onScanFinished(const QImage &image)
 {
-    QString scanDir = getSaveDirectory();
-
-    // generate a file name with timestamp
-    QString fileName = QString("%1.%2").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"))
-                               .arg(FORMATS[m_imageSettings->format].toLower());
-
-    // handle color mode conversion
-    QImage processedImage = image;
-    // handle color mode conversion
-    if (m_imageSettings->colorMode == 1) {   // GRAYSCALE
-        processedImage = image.convertToFormat(QImage::Format_Grayscale8);
-    } else if (m_imageSettings->colorMode == 2) {   // BLACKWHITE
-        // 使用改进的黑白转换算法
-        processedImage = convertToBlackWhite(image);
-    }
-    
-    // Paper size handling
-    ScannerDevice::PaperSize targetPaperSize = static_cast<ScannerDevice::PaperSize>(m_imageSettings->paperSize);
-    
-    // Get current DPI for scaling
-    int currentDPI = 300;  // Default DPI
+    // Processing a full page (black and white conversion, paper size detection and scaling)
+    // and writing the file takes seconds, so it runs on a worker thread. The widget state is
+    // read here, because it belongs to the UI thread.
+    ScanSaveRequest request;
+    request.image = image;
+    request.filePath = QDir(getSaveDirectory())
+                           .filePath(QString("%1.%2").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"))
+                                         .arg(FORMATS[m_imageSettings->format].toLower()));
+    request.formatIndex = m_imageSettings->format;
+    request.colorMode = m_imageSettings->colorMode;
+    request.paperSize = static_cast<ScannerDevice::PaperSize>(m_imageSettings->paperSize);
     if (m_device && m_isScanner) {
         auto scanner = dynamic_cast<ScannerDevice*>(m_device);
         if (scanner) {
-            currentDPI = scanner->getResolution();
+            request.dpi = scanner->getResolution();
         }
     }
-    
+
+    auto *watcher = new QFutureWatcher<ScanSaveResult>(this);
+    connect(watcher, &QFutureWatcher<ScanSaveResult>::finished, this, [this, watcher]() {
+        const ScanSaveResult result = watcher->result();
+        watcher->deleteLater();
+
+        // QPrinter is not used from a worker thread, so a PDF is rendered here.
+        const bool saveSuccess = result.needsPdfRender ? renderPdf(result) : result.success;
+
+        if (saveSuccess) {
+            qCDebug(app) << "Scan saved to:" << result.filePath;
+            // add the saved file path to the top of the history box
+            m_historyEdit->moveCursor(QTextCursor::Start);
+            m_historyEdit->insertPlainText(result.filePath + "\n");
+        } else {
+            qCWarning(app) << "Failed to save scan to:" << result.filePath;
+        }
+    });
+    watcher->setFuture(QtConcurrent::run(&ScanWidget::saveScan, request));
+}
+
+// Runs on a worker thread: it must not touch any widget state.
+ScanWidget::ScanSaveResult ScanWidget::saveScan(const ScanSaveRequest &request)
+{
+    ScanSaveResult result;
+    result.filePath = request.filePath;
+    result.paperSize = request.paperSize;
+
+    QImage processedImage = request.image;
+    if (request.colorMode == 1) {   // GRAYSCALE
+        processedImage = processedImage.convertToFormat(QImage::Format_Grayscale8);
+    } else if (request.colorMode == 2) {   // BLACKWHITE
+        // 使用改进的黑白转换算法
+        processedImage = convertToBlackWhite(processedImage);
+    }
+
     // Handle paper size detection and scaling
-    if (targetPaperSize == ScannerDevice::PAPER_SIZE_AUTO) {
+    if (request.paperSize == ScannerDevice::PAPER_SIZE_AUTO) {
         // Auto-detect paper size
-        ScannerDevice::PaperSize detectedSize = detectPaperSize(processedImage);
+        const ScannerDevice::PaperSize detectedSize = detectPaperSize(processedImage, request.dpi);
         qDebug() << "Auto-detected paper size:" << detectedSize;
-        
+
         // Scale to detected size if needed
         if (detectedSize != ScannerDevice::PAPER_SIZE_AUTO) {
-            processedImage = scaleToPaperSize(processedImage, detectedSize, currentDPI);
+            processedImage = scaleToPaperSize(processedImage, detectedSize, request.dpi);
         }
     } else {
         // Use manually selected paper size
-        qDebug() << "Using selected paper size:" << targetPaperSize;
-        processedImage = scaleToPaperSize(processedImage, targetPaperSize, currentDPI);
+        qDebug() << "Using selected paper size:" << request.paperSize;
+        processedImage = scaleToPaperSize(processedImage, request.paperSize, request.dpi);
     }
 
-    QString filePath = QDir(scanDir).filePath(fileName);
-    bool saveSuccess = false;
-
-    if (m_imageSettings->format < 4) {   // PNG/JPG/BMP/TIFF
-        saveSuccess = processedImage.save(filePath, FORMATS[m_imageSettings->format].toLatin1().constData());
-    } else if (m_imageSettings->format == 4) {   // PDF
-        QPrinter printer(QPrinter::HighResolution);
-        printer.setOutputFormat(QPrinter::PdfFormat);
-        printer.setOutputFileName(filePath);
-        
-        // Set page size based on selected paper size
-        QPageSize::PageSizeId pageSizeId = QPageSize::A4;  // Default
-        switch (targetPaperSize) {
-            case ScannerDevice::PAPER_SIZE_A3:
-                pageSizeId = QPageSize::A3;
-                break;
-            case ScannerDevice::PAPER_SIZE_A4:
-                pageSizeId = QPageSize::A4;
-                break;
-            case ScannerDevice::PAPER_SIZE_A5:
-                pageSizeId = QPageSize::A5;
-                break;
-            case ScannerDevice::PAPER_SIZE_A6:
-                pageSizeId = QPageSize::A6;
-                break;
-            case ScannerDevice::PAPER_SIZE_B4:
-                pageSizeId = QPageSize::B4;
-                break;
-            case ScannerDevice::PAPER_SIZE_B5:
-                pageSizeId = QPageSize::B5;
-                break;
-            case ScannerDevice::PAPER_SIZE_AUTO:
-            default:
-                // For auto mode, use the detected paper size or default to A4
-                // Note: The image has already been scaled to the correct size
-                pageSizeId = QPageSize::A4;
-                break;
-        }
-        printer.setPageSize(QPageSize(pageSizeId));
-        
-        QPainter painter;
-        if (painter.begin(&printer)) {
-            QRect rect = painter.viewport();
-            QSize size = processedImage.size();
-            size.scale(rect.size(), Qt::KeepAspectRatio);
-            painter.setViewport(rect.x(), rect.y(), size.width(), size.height());
-            painter.setWindow(processedImage.rect());
-            painter.drawImage(0, 0, processedImage);
-            painter.end();
-            saveSuccess = true;
-        }
+    if (request.formatIndex < 4) {   // PNG/JPG/BMP/TIFF
+        result.success = processedImage.save(result.filePath, FORMATS[request.formatIndex].toLatin1().constData());
+    } else if (request.formatIndex == 4) {   // PDF
+        // The rendering happens on the UI thread, see onScanFinished().
+        result.image = processedImage;
+        result.needsPdfRender = true;
     } else {
         // Create vector of images
-        QVector<QImage> images;   
+        QVector<QImage> images;
         images.append(processedImage);
 
         // Write OFD file
         ofd::Writer writer;
-        
+
         // Get paper size dimensions in mm for OFD
-        QSizeF paperSizeMM = ScannerDevice::getPaperSizeDimensions(targetPaperSize);
-        
-        saveSuccess = writer.createFromImages(filePath, images, 0, 0, 
-                                              paperSizeMM.width(), paperSizeMM.height());
-        if (!saveSuccess) {
+        const QSizeF paperSizeMM = ScannerDevice::getPaperSizeDimensions(request.paperSize);
+
+        result.success = writer.createFromImages(result.filePath, images, 0, 0,
+                                                paperSizeMM.width(), paperSizeMM.height());
+        if (!result.success) {
             qCWarning(app) << "Failed to create OFD file";
         }
     }
 
-    if (saveSuccess) {
-        qCDebug(app) << "Scan saved to:" << filePath;
-        // add the saved file path to the top of the history box
-        m_historyEdit->moveCursor(QTextCursor::Start);
-        m_historyEdit->insertPlainText(filePath + "\n");
-    } else {
-        qCWarning(app) << "Failed to save scan to:" << filePath;
-    }
+    return result;
 }
+
+// Runs on the UI thread, because QPrinter is not used from a worker thread.
+bool ScanWidget::renderPdf(const ScanSaveResult &result)
+{
+    QPrinter printer(QPrinter::HighResolution);
+    printer.setOutputFormat(QPrinter::PdfFormat);
+    printer.setOutputFileName(result.filePath);
+
+    // Set page size based on selected paper size
+    QPageSize::PageSizeId pageSizeId = QPageSize::A4;  // Default
+    switch (result.paperSize) {
+        case ScannerDevice::PAPER_SIZE_A3:
+            pageSizeId = QPageSize::A3;
+            break;
+        case ScannerDevice::PAPER_SIZE_A4:
+            pageSizeId = QPageSize::A4;
+            break;
+        case ScannerDevice::PAPER_SIZE_A5:
+            pageSizeId = QPageSize::A5;
+            break;
+        case ScannerDevice::PAPER_SIZE_A6:
+            pageSizeId = QPageSize::A6;
+            break;
+        case ScannerDevice::PAPER_SIZE_B4:
+            pageSizeId = QPageSize::B4;
+            break;
+        case ScannerDevice::PAPER_SIZE_B5:
+            pageSizeId = QPageSize::B5;
+            break;
+        case ScannerDevice::PAPER_SIZE_AUTO:
+        default:
+            // For auto mode, use the detected paper size or default to A4
+            // Note: the image has already been scaled to the correct size
+            pageSizeId = QPageSize::A4;
+            break;
+    }
+    printer.setPageSize(QPageSize(pageSizeId));
+
+    QPainter painter;
+    if (!painter.begin(&printer)) {
+        return false;
+    }
+
+    QRect rect = painter.viewport();
+    QSize size = result.image.size();
+    size.scale(rect.size(), Qt::KeepAspectRatio);
+    painter.setViewport(rect.x(), rect.y(), size.width(), size.height());
+    painter.setWindow(result.image.rect());
+    painter.drawImage(0, 0, result.image);
+    painter.end();
+    return true;
+}
+
 
 void ScanWidget::onScanModeChanged(int index)
 {
@@ -875,24 +903,15 @@ QImage ScanWidget::convertToBlackWhite(const QImage &sourceImage)
     return finalResult;
 }
 
-ScannerDevice::PaperSize ScanWidget::detectPaperSize(const QImage &image)
+ScannerDevice::PaperSize ScanWidget::detectPaperSize(const QImage &image, int dpi)
 {
     if (image.isNull()) {
         return ScannerDevice::PAPER_SIZE_A4;  // Default to A4
     }
-    
-    // Get current DPI from scanner device
-    int currentDPI = 300;  // Default DPI
-    if (m_device && m_isScanner) {
-        auto scanner = dynamic_cast<ScannerDevice*>(m_device);
-        if (scanner) {
-            currentDPI = scanner->getResolution();
-        }
-    }
-    
+
     // Calculate physical dimensions in millimeters
-    double widthMM = (image.width() * 25.4) / currentDPI;
-    double heightMM = (image.height() * 25.4) / currentDPI;
+    double widthMM = (image.width() * 25.4) / dpi;
+    double heightMM = (image.height() * 25.4) / dpi;
     
     qDebug() << "Detected image size:" << widthMM << "x" << heightMM << "mm";
     

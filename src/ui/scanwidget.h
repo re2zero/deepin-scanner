@@ -65,15 +65,40 @@ private slots:
     void onDeviceOpened();
 
 private:
+    // Everything the worker needs to process and save a scan; gathered on the UI thread
+    // because the image settings and the device belong to it.
+    struct ScanSaveRequest {
+        QImage image;
+        QString filePath;
+        int formatIndex = 0;
+        int colorMode = 0;
+        ScannerDevice::PaperSize paperSize = ScannerDevice::PAPER_SIZE_AUTO;
+        int dpi = 300;
+    };
+
+    // Result of saveScan(); the processed image is only handed back for the PDF format,
+    // which is rendered on the UI thread.
+    struct ScanSaveResult {
+        QString filePath;
+        bool success = false;
+        bool needsPdfRender = false;
+        QImage image;
+        ScannerDevice::PaperSize paperSize = ScannerDevice::PAPER_SIZE_AUTO;
+    };
+
     void setupUI();
     void connectDeviceSignals(bool bind);
     void updateDeviceSettings();
     void resetPreview();
-    QImage convertToBlackWhite(const QImage &sourceImage);
-    
+
+    // Processing and saving run on a worker thread, so these must not touch widget state.
+    static ScanSaveResult saveScan(const ScanSaveRequest &request);
+    static bool renderPdf(const ScanSaveResult &result);
+    static QImage convertToBlackWhite(const QImage &sourceImage);
+
     // Paper size handling methods
-    ScannerDevice::PaperSize detectPaperSize(const QImage &image);
-    QImage scaleToPaperSize(const QImage &image, ScannerDevice::PaperSize targetSize, int dpi);
+    static ScannerDevice::PaperSize detectPaperSize(const QImage &image, int dpi);
+    static QImage scaleToPaperSize(const QImage &image, ScannerDevice::PaperSize targetSize, int dpi);
 
     DeviceBase* m_device = nullptr;
     bool m_isScanner;
