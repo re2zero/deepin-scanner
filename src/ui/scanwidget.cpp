@@ -379,7 +379,8 @@ void ScanWidget::startCameraPreview()
         auto webcam = dynamic_cast<WebcamDevice*>(m_device);
         if (webcam) {
             m_previewLabel->setText(tr("Initializing preview..."));
-            webcam->stopPreview();
+            // The stream is already open: openDevice() starts it on the thread that opens
+            // the camera, so stopping it here would only restart it for nothing.
             QTimer::singleShot(100, [webcam]() {
                 webcam->startPreview();
             });

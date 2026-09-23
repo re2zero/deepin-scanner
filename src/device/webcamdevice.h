@@ -35,6 +35,9 @@ public:
     QString currentDeviceName() const override { return m_currentDeviceName; }
 
     // Extended webcam-specific interface
+    // S_FMT/REQBUFS/STREAMON, which takes about a second on a 1080p camera. The caller
+    // decides on which thread it runs; it does nothing when the stream is already on.
+    bool startStream();
     void startPreview();
     void stopPreview();
 
@@ -76,6 +79,8 @@ private:
     int m_currentBuffer;   // Currently used buffer
     bool m_isInitialized;
     bool m_deviceSelected;
+    // Whether the V4L2 stream is on, so that startStream() does not restart an active one.
+    bool m_streaming = false;
     // Set once a broken stream has been reported, so a device that is gone is reported
     // only once instead of on every preview tick.
     bool m_disconnectReported = false;

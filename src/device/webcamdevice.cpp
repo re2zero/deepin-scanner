@@ -225,6 +225,11 @@ bool WebcamDevice::openDevice(const QString &devicePath)
     // Enumerate supported resolutions
     enumerateSupportedResolutions();
 
+    // Open the stream here, at the end of the device setup: openDevice() runs on a worker
+    // thread, so the ~1 s STREAMON of a 1080p camera no longer freezes the UI. It has to
+    // stay after enumerateSupportedResolutions(), which probes formats.
+    startStream();
+
     return true;
 }
 
@@ -368,6 +373,7 @@ bool WebcamDevice::startCapturing()
     // Ensure stream is stopped before enqueuing buffers
     v4l2_buf_type stopType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(m_fd, VIDIOC_STREAMOFF, &stopType);
+    m_streaming = false;
 
     // Debug buffer status
     qCDebug(app) << "Buffer status:";
@@ -462,6 +468,7 @@ bool WebcamDevice::startCapturing()
                 QThread::msleep(50);
                 if (ioctl(m_fd, VIDIOC_STREAMON, &type) != -1) {
                     qCInfo(app) << "Video capture stream started successfully after retry";
+                    m_streaming = true;
                     return true;
                 }
                 if (errno != EAGAIN) {
@@ -476,6 +483,7 @@ bool WebcamDevice::startCapturing()
     }
 
     qCInfo(app) << "Video capture stream started successfully";
+    m_streaming = true;
     return true;
 }
 
@@ -483,20 +491,33 @@ void WebcamDevice::stopCapturing()
 {
     v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(m_fd, VIDIOC_STREAMOFF, &type);
+    m_streaming = false;
 }
 
-void WebcamDevice::startPreview()
+bool WebcamDevice::startStream()
 {
     if (!m_isInitialized) {
-        return;
+        return false;
+    }
+
+    if (m_streaming) {
+        return true;
     }
 
     if (!startCapturing()) {
-        return;
+        return false;
     }
 
     adjustCommonCameraSettings();
     setCameraAutoFocus(true);
+    return true;
+}
+
+void WebcamDevice::startPreview()
+{
+    if (!startStream()) {
+        return;
+    }
 
     // Clear latest frame
     {
