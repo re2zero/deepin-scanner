@@ -41,6 +41,7 @@ ScannerDevice::ScannerDevice(QObject *parent)
     connect(this, &ScannerDevice::triggerCloseDevice, m_worker, &ScannerWorker::doCloseDevice);
     connect(this, &ScannerDevice::triggerStartScan, m_worker, &ScannerWorker::doStartScan);
     connect(this, &ScannerDevice::triggerCancelScan, m_worker, &ScannerWorker::doCancelScan);
+    connect(this, &ScannerDevice::triggerGetAvailableDevices, m_worker, &ScannerWorker::doGetAvailableDevices);
 
     // --- Connect signals from worker back to this (UI) thread's ddslots ---
     connect(m_worker, &ScannerWorker::errorOccurred, this, &ScannerDevice::onWorkerError);
@@ -51,6 +52,7 @@ ScannerDevice::ScannerDevice(QObject *parent)
         emit deviceUnavailable(deviceName);
     });
     connect(m_worker, &ScannerWorker::deviceUnavailable, this, &ScannerDevice::deviceUnavailable);
+    connect(m_worker, &ScannerWorker::availableDevicesReady, this, &ScannerDevice::onAvailableDevicesReady);
     connect(m_worker, &ScannerWorker::captureCompleted, this, &ScannerDevice::onCaptureCompleted);
     connect(m_worker, &ScannerWorker::scanProgress, this, &ScannerDevice::scanProgress); // Forward signal
 
@@ -86,42 +88,26 @@ bool ScannerDevice::initialize()
 
 QStringList ScannerDevice::getAvailableDevices()
 {
-    // This is synchronous for now, but could be moved to the worker if it proves slow.
-#ifndef _WIN32
-    const SANE_Device **device_list;
-    QStringList deviceNames;
+    // The SANE enumeration runs in the worker thread, see requestAvailableDevices(): it can
+    // block for seconds on network backends, which must not happen on the UI thread.
+    // Callers get the last list reported by the worker.
+    return m_availableDevices;
+}
 
-    SANE_Status status = sane_get_devices(&device_list, SANE_FALSE);
-    if (status != SANE_STATUS_GOOD) {
-        emit errorOccurred(tr("Failed to get device list: %1").arg(sane_strstatus(status)));
-        return deviceNames;
-    }
+void ScannerDevice::requestAvailableDevices()
+{
+    emit triggerGetAvailableDevices();
+}
 
-    if (device_list) {
-        for (int i = 0; device_list[i] != nullptr; ++i) {
-            if (device_list[i]->name) {
-                deviceNames.append(QString::fromUtf8(device_list[i]->name));
-            }
-        }
-    }
-    
-    if (deviceNames.isEmpty() && ADD_TEST_DEVICE) {
-        deviceNames.append("test:0");
-    }
-
-    return deviceNames;
-#else
-    if (ADD_TEST_DEVICE) {
-        return QStringList() << "test:0";
-    }
-    return QStringList();
-#endif
+void ScannerDevice::onAvailableDevicesReady(const QStringList &deviceNames)
+{
+    m_availableDevices = deviceNames;
+    emit availableDevicesReady(deviceNames);
 }
 
 bool ScannerDevice::openDevice(const QString &deviceName)
 {
     m_currentDeviceName = deviceName;
-    m_deviceOpening = true;
     emit triggerOpenDevice(deviceName);
     return true; // Asynchronous operation, success is reported via signal
 }
@@ -263,7 +249,6 @@ QSizeF ScannerDevice::getPaperSizeDimensions(PaperSize size)
 void ScannerDevice::onWorkerError(const QString &errorMessage)
 {
     m_isCapturing = false;
-    m_deviceOpening = false;
     if (!m_deviceOpen) {
         // The error came from an open attempt: no open is in flight any more, so drop
         // the queued scan request together with the device name that marks it.
@@ -277,7 +262,6 @@ void ScannerDevice::onWorkerError(const QString &errorMessage)
 void ScannerDevice::onDeviceOpened(const QList<int> &resolutions, const QList<ScannerDevice::ScanMode> &modes)
 {
     m_deviceOpen = true;
-    m_deviceOpening = false;
     m_supportedResolutions = resolutions;
     m_supportedScanModes = modes;
 
@@ -377,6 +361,37 @@ ScannerWorker::~ScannerWorker()
     qCInfo(app) << "SANE backend exited from worker destructor.";
 }
 
+
+void ScannerWorker::doGetAvailableDevices()
+{
+#ifndef _WIN32
+    const SANE_Device **device_list = nullptr;
+    QStringList deviceNames;
+
+    SANE_Status status = sane_get_devices(&device_list, SANE_FALSE);
+    if (status != SANE_STATUS_GOOD) {
+        emit errorOccurred(tr("Failed to get device list: %1").arg(sane_strstatus(status)));
+        emit availableDevicesReady(deviceNames);
+        return;
+    }
+
+    if (device_list) {
+        for (int i = 0; device_list[i] != nullptr; ++i) {
+            if (device_list[i]->name) {
+                deviceNames.append(QString::fromUtf8(device_list[i]->name));
+            }
+        }
+    }
+
+    if (deviceNames.isEmpty() && ADD_TEST_DEVICE) {
+        deviceNames.append("test:0");
+    }
+
+    emit availableDevicesReady(deviceNames);
+#else
+    emit availableDevicesReady(ADD_TEST_DEVICE ? QStringList() << "test:0" : QStringList());
+#endif
+}
 
 void ScannerWorker::doOpenDevice(const QString &deviceName)
 {

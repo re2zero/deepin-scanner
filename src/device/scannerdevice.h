@@ -61,10 +61,11 @@ public:
     bool isCapturing() const override;
     DeviceType getDeviceType() const override { return DeviceType::Scanner; }
     QString currentDeviceName() const override { return m_currentDeviceName; }
-    // True while an open request has been issued but its result has not arrived yet.
-    bool isOpening() const { return m_deviceOpening; }
 
     // Extended scanner-specific interface
+    // Asks the worker to enumerate the devices, the result arrives with
+    // availableDevicesReady().
+    void requestAvailableDevices();
     void startScan(const QString &tempOutputFilePath);
     void cancelScan();
     bool setScanMode(ScanMode mode);
@@ -87,12 +88,14 @@ signals:
     void triggerCloseDevice();
     void triggerStartScan(const QString &filePath, int dpi, ScanMode mode, ColorMode colorMode, PaperSize paperSize);
     void triggerCancelScan();
+    void triggerGetAvailableDevices();
 
     // Forwarded signals from worker
     void scanProgress(int percentage);
     void deviceOpened();
     void deviceClosed();
     void deviceUnavailable(const QString &deviceName);
+    void availableDevicesReady(const QStringList &deviceNames);
 
 private slots:
     // Slots to handle results from the worker thread
@@ -100,13 +103,15 @@ private slots:
     void onDeviceOpened(const QList<int> &resolutions, const QList<ScannerDevice::ScanMode> &modes);
     void onDeviceClosed();
     void onCaptureCompleted(const QString &filePath);
+    void onAvailableDevicesReady(const QStringList &deviceNames);
 
 private:
     QString m_currentDeviceName;
     bool m_isCapturing = false;
     bool m_deviceOpen = false;
-    bool m_deviceOpening = false; // True while an open request is in flight
     bool m_scanPending = false; // True if a scan was requested before device was open
+    // Last device list reported by the worker, see getAvailableDevices().
+    QStringList m_availableDevices;
 
     QThread m_workerThread;
     ScannerWorker *m_worker = nullptr;
@@ -133,6 +138,7 @@ public slots:
     void doCloseDevice();
     void doStartScan(const QString &tempOutputFilePath, int dpi, ScannerDevice::ScanMode mode, ScannerDevice::ColorMode colorMode, ScannerDevice::PaperSize paperSize);
     void doCancelScan();
+    void doGetAvailableDevices();
 
 signals:
     void errorOccurred(const QString &errorMessage);
@@ -140,6 +146,7 @@ signals:
     void deviceClosed();
     void deviceDisconnected(const QString &deviceName);
     void deviceUnavailable(const QString &deviceName);
+    void availableDevicesReady(const QStringList &deviceNames);
     void captureCompleted(const QString &filePath);
     void scanProgress(int percentage);
 
