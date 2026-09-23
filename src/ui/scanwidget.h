@@ -76,14 +76,10 @@ private:
         int dpi = 300;
     };
 
-    // Result of saveScan(); the processed image is only handed back for the PDF format,
-    // which is rendered on the UI thread.
+    // Result of saveScan().
     struct ScanSaveResult {
         QString filePath;
         bool success = false;
-        bool needsPdfRender = false;
-        QImage image;
-        ScannerDevice::PaperSize paperSize = ScannerDevice::PAPER_SIZE_AUTO;
     };
 
     void setupUI();
@@ -93,7 +89,7 @@ private:
 
     // Processing and saving run on a worker thread, so these must not touch widget state.
     static ScanSaveResult saveScan(const ScanSaveRequest &request);
-    static bool renderPdf(const ScanSaveResult &result);
+    static bool renderPdf(const QImage &image, const QString &filePath, ScannerDevice::PaperSize paperSize);
     static QImage convertToBlackWhite(const QImage &sourceImage);
 
     // Paper size handling methods

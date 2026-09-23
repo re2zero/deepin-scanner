@@ -562,10 +562,7 @@ void ScanWidget::onScanFinished(const QImage &image)
         const ScanSaveResult result = watcher->result();
         watcher->deleteLater();
 
-        // QPrinter is not used from a worker thread, so a PDF is rendered here.
-        const bool saveSuccess = result.needsPdfRender ? renderPdf(result) : result.success;
-
-        if (saveSuccess) {
+        if (result.success) {
             qCDebug(app) << "Scan saved to:" << result.filePath;
             // add the saved file path to the top of the history box
             m_historyEdit->moveCursor(QTextCursor::Start);
@@ -582,7 +579,6 @@ ScanWidget::ScanSaveResult ScanWidget::saveScan(const ScanSaveRequest &request)
 {
     ScanSaveResult result;
     result.filePath = request.filePath;
-    result.paperSize = request.paperSize;
 
     QElapsedTimer saveTimer;
     saveTimer.start();
@@ -617,9 +613,7 @@ ScanWidget::ScanSaveResult ScanWidget::saveScan(const ScanSaveRequest &request)
     if (request.formatIndex < 4) {   // PNG/JPG/BMP/TIFF
         result.success = processedImage.save(result.filePath, FORMATS[request.formatIndex].toLatin1().constData());
     } else if (request.formatIndex == 4) {   // PDF
-        // The rendering happens on the UI thread, see onScanFinished().
-        result.image = processedImage;
-        result.needsPdfRender = true;
+        result.success = renderPdf(processedImage, result.filePath, request.paperSize);
     } else {
         // Create vector of images
         QVector<QImage> images;
@@ -642,16 +636,17 @@ ScanWidget::ScanSaveResult ScanWidget::saveScan(const ScanSaveRequest &request)
     return result;
 }
 
-// Runs on the UI thread, because QPrinter is not used from a worker thread.
-bool ScanWidget::renderPdf(const ScanSaveResult &result)
+// Runs on a worker thread: QPrinter is created and used there, which Qt allows for the
+// PDF output format (a QPrinter must be created in the thread that paints on it).
+bool ScanWidget::renderPdf(const QImage &image, const QString &filePath, ScannerDevice::PaperSize paperSize)
 {
     QPrinter printer(QPrinter::HighResolution);
     printer.setOutputFormat(QPrinter::PdfFormat);
-    printer.setOutputFileName(result.filePath);
+    printer.setOutputFileName(filePath);
 
     // Set page size based on selected paper size
     QPageSize::PageSizeId pageSizeId = QPageSize::A4;  // Default
-    switch (result.paperSize) {
+    switch (paperSize) {
         case ScannerDevice::PAPER_SIZE_A3:
             pageSizeId = QPageSize::A3;
             break;
@@ -685,11 +680,11 @@ bool ScanWidget::renderPdf(const ScanSaveResult &result)
     }
 
     QRect rect = painter.viewport();
-    QSize size = result.image.size();
+    QSize size = image.size();
     size.scale(rect.size(), Qt::KeepAspectRatio);
     painter.setViewport(rect.x(), rect.y(), size.width(), size.height());
-    painter.setWindow(result.image.rect());
-    painter.drawImage(0, 0, result.image);
+    painter.setWindow(image.rect());
+    painter.drawImage(0, 0, image);
     painter.end();
     return true;
 }
